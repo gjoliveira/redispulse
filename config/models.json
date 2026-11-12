@@ -1,0 +1,49 @@
+
+{
+  "models": [
+    {
+      "model_id": "llm-conversation",
+      "name": "ConversationLLM",
+      "description": "Simulated conversational LLM",
+      "created_at_ms": 1700000000000,
+      "status": "active"
+    },
+    {
+      "model_id": "llm-code",
+      "name": "CodeLLM",
+      "description": "Simulated code generation LLM",
+      "created_at_ms": 1700000000000,
+      "status": "active"
+    }
+  ],
+  "versions": [
+    {
+      "version_id": "conv-v1",
+      "model_id": "llm-conversation",
+      "version_label": "v1.0",
+      "created_at_ms": 1700000000000,
+      "status": "active"
+    },
+    {
+      "version_id": "conv-v2",
+      "model_id": "llm-conversation",
+      "version_label": "v1.1",
+      "created_at_ms": 1700000000000,
+      "status": "active"
+    },
+    {
+      "version_id": "code-v1",
+      "model_id": "llm-code",
+      "version_label": "v1.0",
+      "created_at_ms": 1700000000000,
+      "status": "active"
+    },
+    {
+      "version_id": "code-v2",
+      "model_id": "llm-code",
+      "version_label": "v1.1",
+      "created_at_ms": 1700000000000,
+      "status": "active"
+    }
+  ]
+}
