@@ -48,38 +48,40 @@ machine-learning models.
 - Load Azure LLM inference traces from CSV
 - Validate model, version, and inference event schemas
 - Generate simulated inference events
-- Export sample events to JSONL
-- Run automated generator tests
+- Store models, versions and inference events in Redis
+- Search and filter events with Redis Search
+- Aggregate monitoring metrics and compare versions
+- Apply event and metrics retention
+- Run automated tests against an isolated Redis
 - Run Redis and FastAPI with Docker Compose
 - Check API and Redis connectivity
 
-Redis event storage, monitoring queries, metric aggregation,
-and the dashboard are not implemented yet.
+The FastAPI query endpoints and the dashboard are not
+implemented yet.
 
 ## Project structure
 
 ```text
 redispulse/
 ├── app/
-│   ├── main.py
-│   └── schemas.py
+│   ├── main.py            # FastAPI app (health check)
+│   ├── schemas.py
+│   ├── redis_registry.py  # models and versions
+│   └── redis_events.py    # events, search, metrics, retention
 ├── config/
-│   └── models.json
+│   └── models.json        # simulated models and versions
 ├── data/
-│   ├── raw/
+│   ├── raw/               # Azure CSV traces (not in Git)
 │   └── sample/
-│       └── events.jsonl
-├── docs/
-│   └── SHARED_FOUNDATION.md
+│       └── events.jsonl   # shared baseline of 200 events
+├── docs/                  # M1/M2 documentation
 ├── simulator/
 │   ├── generator.py
 │   └── trace_loader.py
 ├── tests/
-│   └── test_generator.py
 ├── compose.yaml
+├── compose.test.yaml      # isolated Redis for tests
 ├── Dockerfile
-├── export_sample.py
-├── inspect_dataset.py
 └── requirements.txt
 ```
 
@@ -120,18 +122,6 @@ From the project root, with the Python environment active:
 python -m simulator.generator
 ```
 
-Export 200 sample events:
-
-```bash
-python export_sample.py
-```
-
-Output:
-
-```text
-data/sample/events.jsonl
-```
-
 ### Run tests
 
 The Redis tests use a separate Redis container on port 6380, so
@@ -151,8 +141,8 @@ limitations, and M2 handoff.
 
 ## Project status
 
-The shared foundation is implemented.
+The shared foundation, the Redis database design (M2)
+and the Redis data layer are implemented.
 
-The Redis database design, application queries,
-aggregations, and monitoring dashboard are planned
-for subsequent development stages.
+The API query endpoints and the monitoring dashboard
+are planned for subsequent development stages.
