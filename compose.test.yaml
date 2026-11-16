@@ -1,0 +1,16 @@
+# Isolated, ephemeral Redis for the automated test suite.
+# Separate project name and port so it never touches development data.
+#
+#   docker compose -f compose.test.yaml up -d
+#   python -m pytest tests/ -v
+#   docker compose -f compose.test.yaml down
+name: redispulse-test
+
+services:
+  redis-test:
+    image: redis:8
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    tmpfs:
+      - /data

@@ -23,11 +23,11 @@ Three modeling decisions are analyzed:
 | E2 — Indexing | Manual indexes; Redis Search | Redis Search |
 | E3 — Metrics | Raw-event scans; maintained aggregates; Redis Time Series | Maintained Hash aggregates |
 
-The selections are based on analytical reasoning and the application's requirements. They are **proposed design choices, not experimentally validated performance results**.
+The selections are based on analytical reasoning and the application's requirements. They are **design choices supported by functional implementation and testing, not experimentally validated performance results**.
 
 ## 2. Selected Redis Data Model
 
-The selected architecture uses Redis Hashes, Sets, Streams, Redis Search, and time-bucketed metric Hashes.
+The selected architecture uses Redis Hashes, Sets, Streams, Redis Search, time-bucketed metric Hashes, and persistent String markers for lifecycle and duplicate protection.
 
 ### 2.1 Key Organization
 
@@ -39,7 +39,10 @@ The selected architecture uses Redis Hashes, Sets, Streams, Redis Search, and ti
 | `events:<version_id>` | Stream | Ordered inference-event history for one version |
 | `event:<request_id>` | Hash | Individual event details and direct lookup |
 | `idx:events` | Search index | Filtering and full-text search over event Hashes |
-| `metrics:<version_id>:<minute>` | Hash | Monitoring counters for one version and minute |
+| `metrics:<version_id>:<minute_ms>` | Hash | Monitoring counters for one version and minute |
+| `request-used:<request_id>` | String | Permanent duplicate-request protection |
+| `model-used:<model_id>` | String | Prevent deletion of models with inference history |
+| `version-used:<version_id>` | String | Prevent deletion of versions with inference history |
 
 The event Stream and event Hash intentionally contain overlapping information.
 
@@ -47,18 +50,20 @@ The Stream supports recent-event retrieval, while the Hash supports direct looku
 
 This duplication increases storage and write overhead but avoids forcing one data structure to serve incompatible access patterns.
 
+Persistent usage markers provide additional consistency guarantees. In particular, they allow the application to preserve information about previously used request IDs, models, and versions after raw inference events expire.
+
 ### 2.2 Model and Version Metadata
 
 Model metadata is stored in a Hash:
 
 ```redis
-HSET model:llm-conversation name ConversationLLM description "Conversation model" created_at 1767225600000 status active
+HSET model:llm-conversation name ConversationLLM description "Conversation model" created_at_ms 1767225600000 status active
 ```
 
 Version metadata is stored separately:
 
 ```redis
-HSET version:conv-v1 model_id llm-conversation version_label v1.0 created_at 1767225600000 status active
+HSET version:conv-v1 model_id llm-conversation version_label v1.0 created_at_ms 1767225600000 status active
 ```
 
 The relationship between models and versions is represented using a Set:
@@ -75,7 +80,11 @@ Relevant operations include:
 
 Models and versions can be archived by updating their status.
 
-Physical deletion is allowed only for unused records whose relationships permit deletion. Because raw events expire, the implementation must preserve enough lifecycle metadata to distinguish records that have never been used from records whose historical events have expired.
+Physical deletion is allowed only for unused records whose relationships permit deletion. A model cannot be deleted while it has registered versions or inference history. Similarly, a version cannot be deleted after it has been used for inference.
+
+Because raw events expire, permanent `model-used` and `version-used` markers preserve this lifecycle information independently of event retention.
+
+Model and version creation, updating, archiving, and deletion use Redis optimistic transactions where necessary to prevent inconsistent state under concurrent operations.
 
 ## 3. E1 — Event Storage
 
@@ -92,7 +101,7 @@ Key:
 Example:
 
 ```redis
-XADD events:conv-v1 * request_id req-001 model_id llm-conversation version_id conv-v1 timestamp 1767225600000 prediction accepted latency_ms 381.84 status success
+XADD events:conv-v1 * request_id req-001 model_id llm-conversation version_id conv-v1 timestamp_ms 1767225600000 input_tokens 100 output_tokens 50 latency_ms 381.84 status success
 ```
 
 The Stream provides append-oriented ingestion and recent-event retrieval.
@@ -112,10 +121,12 @@ Key:
 Example:
 
 ```redis
-HSET event:req-001 model_id llm-conversation version_id conv-v1 timestamp 1767225600000 prediction accepted latency_ms 381.84 status success
+HSET event:req-001 request_id req-001 model_id llm-conversation version_id conv-v1 timestamp_ms 1767225600000 input_tokens 100 output_tokens 50 latency_ms 381.84 status success
 ```
 
 The Hash stores the complete event representation, including optional fields when present.
+
+The current implementation records token usage, latency, status, and optional error information. The `prediction` and `confidence` fields considered in the initial conceptual model are not part of the implemented event schema.
 
 For Q5:
 
@@ -123,11 +134,13 @@ For Q5:
 HGETALL event:req-001
 ```
 
-The Stream and Hash are written as part of the same ingestion operation.
+The Stream and Hash are written as part of the same transactional ingestion operation.
 
-The initial simulator assigns current simulated ingestion timestamps and produces events in chronological order. Therefore, Stream insertion order is suitable for retrieving recent activity in the initial workload.
+The initial simulator generates inference events with timestamps close to the current time and produces events in chronological order. Therefore, Stream insertion order is suitable for retrieving recent activity in the initial workload.
 
-If arbitrary out-of-order event timestamps become a requirement, additional ordering logic or an event-time index may be necessary.
+However, Stream IDs reflect insertion order rather than the event's original `timestamp_ms`. Consequently, a late-arriving event appears among the most recently ingested events even if its event timestamp is older.
+
+If retrieval ordered strictly by event time becomes a requirement, additional ordering logic or an event-time index may be necessary.
 
 ### 3.2 Alternatives Considered
 
@@ -188,7 +201,7 @@ Q7 requires combined attribute filtering, while Q8 requires keyword search over 
 
 RedisPulse uses Redis Search to index event Hashes.
 
-Proposed index:
+Index name:
 
 `idx:events`
 
@@ -196,42 +209,50 @@ Proposed index:
 |---|---|---|
 | `model_id` | TAG | Filter by model |
 | `version_id` | TAG | Filter by version |
-| `timestamp` | NUMERIC | Time-range filtering |
+| `timestamp_ms` | NUMERIC | Time-range filtering and sorting |
 | `latency_ms` | NUMERIC | Latency thresholds |
 | `status` | TAG | Success/error filtering |
 | `error_message` | TEXT | Keyword search |
 
-An illustrative index definition is:
+The index definition is:
 
 ```redis
-FT.CREATE idx:events ON HASH PREFIX 1 event: SCHEMA model_id TAG version_id TAG timestamp NUMERIC SORTABLE latency_ms NUMERIC status TAG error_message TEXT
+FT.CREATE idx:events ON HASH PREFIX 1 event: SCHEMA model_id TAG version_id TAG timestamp_ms NUMERIC SORTABLE latency_ms NUMERIC status TAG error_message TEXT
 ```
 
-This requires Redis Search to be available in the selected Redis deployment. Availability and command compatibility must be verified with the planned Redis 8.10.3 Docker environment.
+The application checks whether the index already exists before attempting to create it.
+
+This requires Redis Search to be available in the selected Redis deployment. The project uses Redis 8 with Redis Search support through its Docker environment.
 
 ### 4.2 Attribute Filtering — Q7
 
 Example: find failed events for version `conv-v1` with latency of at least 1000 ms.
 
 ```redis
-FT.SEARCH idx:events "@version_id:{conv-v1} @status:{error} @latency_ms:[1000 +inf]" SORTBY timestamp DESC LIMIT 0 100
+FT.SEARCH idx:events "@version_id:{conv\-v1} @status:{error} @latency_ms:[1000 +inf]" SORTBY timestamp_ms DESC LIMIT 0 100 DIALECT 2
 ```
 
-Time-range constraints can be added using the indexed timestamp field.
+Time-range constraints can be added using the indexed `timestamp_ms` field.
+
+The application escapes special characters in TAG values, including hyphens in version identifiers, when constructing search queries.
 
 The application limits results to a maximum of 100 events per request.
+
+Search results identify matching event Hashes, which are then retrieved and validated as inference-event records.
 
 ### 4.3 Full-Text Search — Q8
 
 Example: search error messages containing the word `timeout`.
 
 ```redis
-FT.SEARCH idx:events "@status:{error} @error_message:timeout" SORTBY timestamp DESC LIMIT 0 100
+FT.SEARCH idx:events "@status:{error} @error_message:timeout" SORTBY timestamp_ms DESC LIMIT 0 100 DIALECT 2
 ```
 
 The search can also include version and time restrictions.
 
-Keyword matching follows Redis Search's configured text-analysis semantics rather than an arbitrary substring search.
+Keyword matching follows Redis Search's configured text-analysis semantics rather than arbitrary substring search.
+
+The implemented application validates search terms before constructing the query.
 
 ### 4.4 Alternative: Manual Indexes
 
@@ -281,11 +302,15 @@ RedisPulse maintains one metrics Hash per model version and minute.
 
 Key pattern:
 
-`metrics:<version_id>:<minute>`
+`metrics:<version_id>:<minute_ms>`
 
-Example:
+The minute identifier is a Unix timestamp in milliseconds, rounded down to the beginning of the minute.
 
-`metrics:conv-v1:20260101T0000`
+For example, the minute beginning at `2026-01-01 00:00:00 UTC` is represented by `1767225600000`.
+
+Example key:
+
+`metrics:conv-v1:1767225600000`
 
 Fields:
 
@@ -298,17 +323,27 @@ Fields:
 During ingestion, the relevant counters are updated:
 
 ```redis
-HINCRBY metrics:conv-v1:20260101T0000 total 1
-HINCRBYFLOAT metrics:conv-v1:20260101T0000 latency_sum_ms 381.84
+HINCRBY metrics:conv-v1:1767225600000 total 1
+HINCRBYFLOAT metrics:conv-v1:1767225600000 latency_sum_ms 381.84
 ```
 
 For failed requests, the application also increments:
 
 ```redis
-HINCRBY metrics:conv-v1:20260101T0000 errors 1
+HINCRBY metrics:conv-v1:1767225600000 errors 1
 ```
 
-These commands are illustrative; the actual minute key is calculated from the event timestamp.
+These commands are illustrative. The actual minute key is calculated from each event's `timestamp_ms`:
+
+```python
+minute_ms = (event.timestamp_ms // 60_000) * 60_000
+```
+
+This means that metrics are grouped according to **event time**, not the time at which the event is received by RedisPulse.
+
+Late-arriving events that satisfy the ingestion timestamp policy therefore contribute to their corresponding historical minute bucket.
+
+All metric updates are performed within the event ingestion transaction.
 
 ### 5.2 Derived Metrics
 
@@ -336,9 +371,13 @@ For a selected window:
 
 For windows without requests, counts and rates are reported as zero, while average latency is unavailable.
 
+The application reads the relevant minute Hashes and combines their stored counters rather than scanning individual inference events.
+
 Q10 calculates the same metrics for two versions using identical time boundaries.
 
-The initial design uses minute-aligned monitoring windows. Exact arbitrary-second windows would require additional handling of partial-minute buckets.
+The initial implementation uses minute-aligned monitoring windows. For example, a five-minute query includes the current minute bucket and the preceding four minute buckets.
+
+Consequently, these windows are approximate relative to the exact current second. Exact arbitrary-second windows would require additional handling of partial-minute buckets.
 
 ### 5.3 Alternative A — Raw-Event Scans
 
@@ -392,68 +431,149 @@ This supports Q9 and Q10 while preserving historical metrics independently of ra
 
 ### 6.1 Ingestion Workflow — Q4
 
-For each accepted event, the application:
+For each inference event, RedisPulse:
 
-1. Validates the event and its model-version relationship.
-2. Determines the relevant version Stream and minute bucket.
-3. Writes the event to the Stream.
-4. Writes the corresponding event Hash.
-5. Sets the raw-event expiration.
-6. Updates the metrics counters.
-7. Ensures the metrics bucket has the required retention policy.
+1. Validates the event timestamp and its model-version relationship.
+2. Verifies that the model and version exist and are active.
+3. Checks whether the request ID has already been used.
+4. Determines the relevant version Stream and metrics minute bucket.
+5. Appends the event to the Stream and trims outdated Stream entries.
+6. Stores the corresponding event Hash with a 24-hour TTL.
+7. Creates permanent usage markers for the request, model, and version.
+8. Updates the metrics counters and applies the seven-day metrics retention policy.
 
-The related Redis writes are grouped using `MULTI/EXEC`.
+Related Redis writes are grouped using `MULTI/EXEC`. The implementation also uses `WATCH` to detect concurrent modifications of relevant records and retry transactions when necessary.
 
-This prevents other clients from observing a partially executed sequence of successful transactional writes.
+This prevents conflicting operations from silently producing inconsistent database state, such as an event referencing a version deleted during ingestion.
 
-However, `MULTI/EXEC` does not automatically prevent duplicate request IDs or roll back commands that fail at execution time. The simulator is expected to generate unique request IDs; stronger idempotency guarantees would require additional validation or conditional-write logic.
+The transaction coordinates the Redis writes, although Redis `MULTI/EXEC` does not provide rollback of commands that fail during execution. Input validation and the selected Redis commands therefore remain important.
 
-No consumer group is required because the initial application reads recent history directly and does not use asynchronous Stream consumers.
+**Duplicate protection**
+
+Duplicate ingestion is prevented using a permanent marker:
+
+`request-used:<request_id>`
+
+When an event is accepted, the marker is created in the same transaction as the event records and metrics updates.
+
+Subsequent attempts to ingest the same request ID are rejected.
+
+Unlike the event Hash, this marker does not expire. Therefore, duplicate protection continues to work after the original event has been removed by the retention policy.
+
+Permanent markers introduce a small but continuously growing storage overhead. This trade-off is accepted for the initial proof of concept.
+
+The simulator generates unique request IDs, but the database layer does not rely solely on this assumption.
+
+No consumer group is required because the application reads recent Stream history directly and does not use asynchronous Stream consumers.
 
 ### 6.2 Raw-Event Retention — Q11
 
-Raw events are retained for 24 hours.
+Raw event data is retained for 24 hours after ingestion, subject to the Stream cleanup behavior described below.
 
-Event Hashes receive a TTL:
+**Event Hashes**
+
+Individual event Hashes receive a TTL of 86,400 seconds:
 
 ```redis
 EXPIRE event:req-001 86400
 ```
 
-Per-version Streams are maintained through time-based trimming.
+This allows Redis to remove the Hash automatically after 24 hours.
 
-For Streams using automatically generated IDs based on ingestion time, old entries can be removed using an appropriate `XTRIM MINID` threshold.
+**Per-version Streams**
 
-The threshold must correspond to the configured 24-hour retention boundary.
+Streams are maintained through `XTRIM MINID`, which removes entries whose Stream IDs are older than the retention threshold.
 
-Redis Search indexes event Hashes; expired Hashes must no longer appear as valid event results.
+Since automatically generated Stream IDs are based on Redis server time, the implementation uses Redis `TIME` to calculate the cutoff.
 
-### 6.3 Metrics Retention — Q11
+This avoids inconsistencies caused by differences between the application's clock and the Redis server's clock.
 
-Metrics buckets are retained for seven days.
+Stream trimming occurs during event ingestion and can also be executed explicitly.
 
-Each bucket receives an expiration policy corresponding to its retention period.
+Consequently, a Stream that receives no further events is not automatically trimmed merely because 24 hours have elapsed. Its outdated entries remain until another ingestion or an explicit cleanup operation triggers trimming.
+
+This is a limitation of the ingestion-triggered retention strategy.
+
+**Relationship with event timestamps**
+
+Raw-event retention is based on ingestion time, whereas monitoring metrics are grouped by the event's own timestamp.
+
+An event arriving late may therefore remain stored for more than 24 hours after its original event timestamp.
+
+For example, an event generated 23 hours before ingestion may remain in Redis for approximately another 24 hours.
+
+This distinction follows from the different purposes of the two timestamps:
+
+- Event time determines the monitoring minute bucket.
+- Ingestion time determines raw-data expiration and Stream ordering.
+
+Redis Search indexes the event Hashes, so expired Hashes are no longer available as valid indexed event records.
+
+### 6.3 Metrics Retention and Event-Time Validation — Q11
+
+Metrics buckets are retained for approximately seven days after their corresponding minute.
+
+Each metrics Hash receives an expiration timestamp based on the beginning of its minute bucket, with an additional 60-second allowance.
+
+The retention timestamp is calculated as:
+
+```python
+expiration_s = minute_ms // 1000 + 7 * 86400 + 60
+```
 
 This allows historical summaries to remain available after raw inference events expire.
 
-Because metrics are grouped by minute, retention boundaries have minute-level granularity.
+**Event-time validation**
+
+To prevent outdated or excessively future-dated events from creating inappropriate monitoring buckets, RedisPulse accepts only events satisfying:
+
+```text
+now - 24 hours <= timestamp_ms <= now + 60 seconds
+```
+
+Events outside this interval are rejected before Redis records are created.
+
+The 24-hour backward limit restricts how late an event can arrive. It also prevents very old events from recreating metrics buckets that have already expired.
+
+The 60-second future allowance accommodates small clock differences between event producers and the application.
+
+An accepted event with a slightly future timestamp is assigned to its corresponding future minute bucket. It becomes visible in monitoring windows when that minute is included.
+
+**Metric aggregation**
+
+Accepted events contribute to the bucket corresponding to their own `timestamp_ms`, regardless of their actual ingestion minute.
+
+This preserves event-time semantics while retaining the performance advantages of maintained aggregates.
+
+Because metrics are grouped by minute, retention boundaries and monitoring calculations have minute-level granularity.
 
 ### 6.4 Consistency Considerations
 
-The design must account for:
+RedisPulse uses optimistic transactions (`WATCH` with `MULTI/EXEC`) for operations that require consistency across multiple Redis records.
 
-- Coordinating Stream, Hash, and metrics updates.
-- Avoiding duplicate ingestion.
-- Preventing metrics from being counted twice.
-- Ensuring expired events are not returned by queries.
-- Preserving model/version lifecycle information after event expiration.
-- Maintaining consistent window definitions for version comparisons.
+The implementation addresses the following requirements:
 
-These requirements will guide the implementation.
+- **Atomic ingestion:** Related event writes, duplicate markers, and metrics updates are executed within a Redis transaction.
+- **Duplicate prevention:** Permanent request markers prevent repeated ingestion, including after event expiration.
+- **Referential integrity:** Model and version relationships are validated before event ingestion.
+- **Lifecycle protection:** Models and versions with inference history cannot be physically deleted, even after raw events expire.
+- **Concurrent modifications:** Transactions detect conflicting changes and retry when necessary.
+- **Safe metadata updates:** Model and version updates or archiving cannot recreate partial records after concurrent deletion.
+- **Consistent monitoring:** Metrics use event-time minute buckets, and version comparisons share the same time boundary.
+
+**Validation**
+
+The implemented Redis layer has been tested using an automated pytest suite.
+
+The tests cover model and version management, event ingestion, Redis Search, monitoring metrics, retention policies, and selected concurrency scenarios.
+
+The simplified suite contains 38 passing tests, including simulator tests, executed against an isolated Redis instance.
+
+These results provide functional validation of the implementation but do not constitute a comprehensive performance evaluation or formal proof of concurrent correctness.
 
 ## 7. Preliminary Operation Costs
 
-The following estimates describe the proposed design analytically. They are not benchmark results.
+The following estimates describe the selected design analytically. They are not benchmark results.
 
 Let:
 
@@ -467,7 +587,7 @@ Let:
 | Q1 — Model create/retrieve | `HSET`, `HGETALL` | Direct key access |
 | Q2 — Version create/list | `HSET`, `SADD`, `SMEMBERS`, `HGETALL` | Depends on V |
 | Q3 — Metadata maintenance | `HSET`, `DEL`, `SREM`, relationship checks | Depends on affected relationships |
-| Q4 — Ingest event | `XADD`, `HSET`, `EXPIRE`, counter updates | Fixed number of writes per event, plus indexing |
+| Q4 — Ingest event | `WATCH`, `MULTI/EXEC`, `XADD`, `XTRIM`, `HSET`, `EXPIRE`, `SET`, counter updates | Fixed number of writes per event, plus indexing and trimming |
 | Q5 — Event lookup | `HGETALL` | Direct key access |
 | Q6 — Latest K events | `XREVRANGE` | Depends on K |
 | Q7 — Event filtering | `FT.SEARCH` | Depends on index selectivity and R |
@@ -483,6 +603,8 @@ Retrieving K Stream entries requires work proportional to the returned entries, 
 Search performance depends on index structure, predicate selectivity, sorting, and result size.
 
 Metrics queries examine a bounded number of minute buckets rather than scanning all raw events in the monitoring window.
+
+Event ingestion performs a bounded number of counter and record writes, although Redis Search indexing, transaction retries, and Stream trimming introduce additional costs that depend on database state and workload.
 
 These are qualitative expectations; actual latency, throughput, and memory consumption require experimental measurement.
 
@@ -522,11 +644,33 @@ This trade-off is appropriate for dashboard windows of 5, 15, and 60 minutes.
 
 Synchronous transactional writes keep related event updates together.
 
-**Benefit:** Simpler consistency model without asynchronous consumers.
+**Benefit:** A consistent ingestion workflow without asynchronous consumers, with protection against selected concurrent modifications and duplicate requests.
 
-**Cost:** More work on the ingestion path.
+**Cost:** Additional commands, transaction retries, and persistent usage markers.
 
-Given the initial workload of approximately one event per second with bursts of ten events per second, this is a reasonable design choice to evaluate during later implementation.
+The use of `WATCH` and `MULTI/EXEC` increases implementation complexity compared with independent Redis writes, but provides stronger correctness guarantees for concurrent operations.
+
+Given the initial workload of approximately one event per second with bursts of ten events per second, this is a reasonable design choice to evaluate during later performance testing.
+
+### 8.5 Retention and Event-Time Semantics
+
+Raw-event retention and monitoring aggregation use different time references.
+
+**Benefit:** Raw data expires relative to ingestion, while monitoring metrics reflect when inference events actually occurred.
+
+**Cost:** Late-arriving events may remain stored longer than 24 hours after their original timestamp, and Stream insertion order does not necessarily match event-time order.
+
+The timestamp acceptance window limits excessively late or future-dated events, while Redis-server-based Stream trimming avoids relying on synchronized application and Redis clocks.
+
+### 8.6 Persistent Usage Markers
+
+Permanent usage markers preserve lifecycle and duplicate information after raw-event expiration.
+
+**Benefit:** Prevents repeated request IDs and protects previously used models and versions against deletion.
+
+**Cost:** Marker storage grows over time because these keys do not expire.
+
+For the initial proof of concept, this approach favors straightforward consistency guarantees over implementing a more complex marker-retention policy.
 
 ## 9. Final Design Decisions
 
@@ -538,14 +682,21 @@ Given the initial workload of approximately one event per second with bursts of 
 | Event lookup | Per-request Hashes | Direct request-ID lookup |
 | Filtering and text search | Redis Search | Combined predicates and keyword search |
 | Monitoring metrics | Per-minute Hash aggregates | Efficient summaries and independent retention |
-| Ingestion consistency | Synchronous `MULTI/EXEC` | Coordinate related Redis writes |
-| Raw-event retention | Hash TTL and Stream trimming | Bounded 24-hour history |
-| Metrics retention | Seven-day TTL | Preserve historical summaries |
+| Metric time reference | Event `timestamp_ms` | Aggregate events according to occurrence time |
+| Ingestion consistency | `WATCH` + synchronous `MULTI/EXEC` | Coordinate related Redis writes and detect conflicts |
+| Duplicate protection | Permanent request usage markers | Prevent re-ingestion after raw-event expiration |
+| Lifecycle protection | Permanent model/version usage markers | Preserve inference history information |
+| Raw-event retention | Hash TTL and Stream trimming | Maintain approximately 24-hour ingestion history |
+| Stream retention clock | Redis server time | Align trimming cutoff with Stream IDs |
+| Metrics retention | Seven-day bucket expiration | Preserve historical summaries |
+| Event-time validation | 24-hour backward and 60-second forward window | Reject outdated or excessively future-dated events |
 | Redis Time Series | Not selected initially | Additional complexity is unnecessary for the initial requirements |
 
 The selected architecture is a **hybrid Redis data model** designed around RedisPulse's required access patterns.
 
-It is not claimed to be universally optimal. Its advantages and limitations are justified analytically, and its actual performance can be evaluated in a later milestone.
+It is not claimed to be universally optimal. Its advantages and limitations are justified analytically, and its functional behavior has been evaluated through automated testing.
+
+Performance benchmarking remains necessary to assess actual latency, throughput, and memory consumption.
 
 ## 10. Conclusion
 
@@ -556,7 +707,11 @@ RedisPulse adopts a hybrid architecture combining:
 - Per-request Hashes for direct event access.
 - Redis Search for attribute filtering and error investigation.
 - Per-minute Hash aggregates for monitoring metrics.
+- Permanent usage markers for duplicate prevention and lifecycle protection.
+- Optimistic Redis transactions for consistency under concurrent operations.
 
-The design supports the Q1–Q11 query catalogue while explicitly accounting for storage duplication, indexing overhead, ingestion consistency, and data retention.
+The design supports the Q1–Q11 Query Catalogue while explicitly accounting for storage duplication, indexing overhead, ingestion consistency, event-time semantics, and data retention.
 
-M2 establishes the architecture and its rationale. Implementation and benchmarking can subsequently test the assumptions made in this design.
+The implementation uses event-time aggregation, Redis-server-based Stream trimming, and transactional validation to address additional consistency requirements identified during development.
+
+M2 establishes the architecture and its rationale. The implemented Redis layer has subsequently undergone functional testing, while its performance characteristics can be evaluated in a later milestone.

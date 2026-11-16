@@ -134,8 +134,13 @@ data/sample/events.jsonl
 
 ### Run tests
 
+The Redis tests use a separate Redis container on port 6380, so
+they never affect the development data in the main Redis (port 6379).
+
 ```bash
-python -m unittest discover -s tests -v
+docker compose -f compose.test.yaml up -d
+python -m pytest tests/ -q
+docker compose -f compose.test.yaml down
 ```
 
 ## Documentation

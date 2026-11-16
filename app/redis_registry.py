@@ -8,6 +8,17 @@ class RedisRegistry:
         self.client = client
 
     
+
+    def get_model(self, model_id: str) -> Model | None:
+        key = f"model:{model_id}"
+
+        data = self.client.hgetall(key)
+
+        if not data:
+            return None
+
+        return Model.model_validate(data)
+
     def create_model(self, model: Model) -> bool:
         key = f"model:{model.model_id}"
 
@@ -38,49 +49,45 @@ class RedisRegistry:
                     continue
 
 
-    def get_model(self, model_id: str) -> Model | None:
-        key = f"model:{model_id}"
-
-        data = self.client.hgetall(key)
-
-        if not data:
-            return None
-
-        return Model.model_validate(data)
-
 
     
     def create_version(self, version: ModelVersion) -> bool:
-        # Check that the parent model exists.
-        if self.get_model(version.model_id) is None:
-            raise ValueError("Parent model does not exist")
-
+        model_key = f"model:{version.model_id}"
         version_key = f"version:{version.version_id}"
         versions_key = f"versions:{version.model_id}"
 
-        # Prevent duplicate version IDs.
         with self.client.pipeline() as pipe:
             while True:
                 try:
-                    pipe.watch(version_key)
+                    # Monitor all keys relevant to this operation.
+                    pipe.watch(model_key, version_key, versions_key)
 
+                    # Verify the parent model still exists.
+                    if not pipe.exists(model_key):
+                        pipe.unwatch()
+                        raise ValueError("Parent model does not exist")
+
+                    # Prevent duplicate version IDs.
                     if pipe.exists(version_key):
                         pipe.unwatch()
                         return False
 
                     pipe.multi()
+
                     pipe.hset(
                         version_key,
                         mapping=version.model_dump(),
                     )
+
                     pipe.sadd(versions_key, version.version_id)
+
                     pipe.execute()
                     return True
 
                 except redis.WatchError:
-                    # Another client changed the version
-                    # between our check and transaction.
+                    # Retry if another transaction changed a watched key.
                     continue
+              
 
     def list_versions(self, model_id: str) -> list[ModelVersion]:
         if self.get_model(model_id) is None:
@@ -101,17 +108,46 @@ class RedisRegistry:
         return sorted(versions, key=lambda v: v.version_id)
 
     
+    def _update_hash(self, key: str, updates: dict, schema):
+        """Atomically apply ``updates`` to an existing Hash.
+
+        WATCH + MULTI/EXEC guarantees the HSET only commits if the Hash
+        still exists unchanged since it was read, so a concurrent delete
+        can never be undone by recreating a partial record. The returned
+        object is built from the watched snapshot plus our updates, i.e.
+        exactly the state this transaction committed (re-reading after
+        EXEC could observe a later delete or update instead).
+        """
+        with self.client.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+
+                    data = pipe.hgetall(key)
+
+                    if not data:
+                        pipe.unwatch()
+                        return None
+
+                    if updates:
+                        pipe.multi()
+                        pipe.hset(key, mapping=updates)
+                        pipe.execute()
+                    else:
+                        pipe.unwatch()
+
+                    return schema.model_validate({**data, **updates})
+
+                except redis.WatchError:
+                    # The Hash changed (or was deleted); re-check and retry.
+                    continue
+
     def update_model(
         self,
         model_id: str,
         name: str | None = None,
         description: str | None = None,
     ) -> Model | None:
-        key = f"model:{model_id}"
-
-        if not self.client.exists(key):
-            return None
-
         updates = {}
 
         if name is not None:
@@ -120,52 +156,32 @@ class RedisRegistry:
         if description is not None:
             updates["description"] = description
 
-        if updates:
-            self.client.hset(key, mapping=updates)
-
-        return self.get_model(model_id)
+        return self._update_hash(f"model:{model_id}", updates, Model)
 
     def archive_model(self, model_id: str) -> Model | None:
-        key = f"model:{model_id}"
+        return self._update_hash(
+            f"model:{model_id}", {"status": "archived"}, Model
+        )
 
-        if not self.client.exists(key):
-            return None
-
-        self.client.hset(key, "status", "archived")
-
-        return self.get_model(model_id)
-
-    
     def update_version(
         self,
         version_id: str,
         version_label: str,
     ) -> ModelVersion | None:
-        key = f"version:{version_id}"
-
-        if not self.client.exists(key):
-            return None
-
-        self.client.hset(key, "version_label", version_label)
-
-        data = self.client.hgetall(key)
-        return ModelVersion.model_validate(data)
+        return self._update_hash(
+            f"version:{version_id}",
+            {"version_label": version_label},
+            ModelVersion,
+        )
 
     def archive_version(
         self,
         version_id: str,
     ) -> ModelVersion | None:
-        key = f"version:{version_id}"
+        return self._update_hash(
+            f"version:{version_id}", {"status": "archived"}, ModelVersion
+        )
 
-        if not self.client.exists(key):
-            return None
-
-        self.client.hset(key, "status", "archived")
-
-        data = self.client.hgetall(key)
-        return ModelVersion.model_validate(data)
-
-    
     def delete_version(self, version_id: str) -> bool:
         version_key = f"version:{version_id}"
         used_key = f"version-used:{version_id}"
